@@ -3,9 +3,10 @@
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
-#define MIN(x,y)  y ^ ((x ^ y) & -(x < y))
-#define MAX(x,y)  x ^ ((x ^ y) & -(x < y))
-#define LOG true
+#define MIN(x,y)  y ^ ((x ^ y) & -(x < y))  // calculating minimum of two unsigned integers without branching
+#define MAX(x,y)  x ^ ((x ^ y) & -(x < y))  // calculating maximum of two unsigned integers without branching
+
+#define LOG false  // for debugging
 
 using namespace std;
 using namespace cv;
@@ -13,7 +14,6 @@ using namespace cv;
 __global__ void tmp(unsigned int* dev_min, unsigned int* dev_max, unsigned int num_channel);
 
 __global__ void initialize(unsigned int* dev_min, unsigned int* dev_max, unsigned int num_channel);
-
 
 template <unsigned int block_size>
 __global__ void reduction(unsigned char* dev_vec, unsigned int* dev_min,
@@ -26,31 +26,48 @@ __global__ void enhance(unsigned char* dev_vec, unsigned int* dev_min, unsigned 
 
 int main()
 {
-	Mat img = imread("original.jpg");
+	cudaError_t cudaStatus;
 
-	unsigned int size = img.total(); 
-	unsigned int num_channel = img.channels();
+	Mat img = imread("original.jpg");  // Mat object for loading the input image
+	unsigned int size = img.total();  // size of each channel (row*col)
+	unsigned int num_channel = img.channels();  // number of channels
 	unsigned int tot_size = size * num_channel;
-	unsigned char* vec = img.isContinuous() ? img.data : img.clone().data;
+	Mat* BGR = new Mat[num_channel];  // Mat object for splitting channels
+	split(img, BGR);
 	
-	unsigned char *dev_vec;
-	unsigned int *dev_min, * dev_max;
+	unsigned char *dev_vec;  // device array containing pixel values
+	unsigned int *dev_min, * dev_max; // device arrays for containing minimum/maximum values of channels
+	unsigned char* vec = new unsigned char[tot_size];  // host array containing pixel values
 
-	unsigned char* result = new unsigned char[tot_size];
-	cudaMalloc((void**)&dev_vec, tot_size);
-	cudaMalloc((void**)&dev_min, num_channel * sizeof(unsigned int));
-	cudaMalloc((void**)&dev_max, num_channel * sizeof(unsigned int));
+	// copying pixel values of channels to vec
+	for (unsigned int i = 0; i < num_channel; i++)
+	{
+		for (unsigned int j = 0; j < size; j++)
+		{
+			vec[i * size + j] = (unsigned char)BGR[i].data[j];
+		}
+	}
 
-	cudaMemcpy(dev_vec, vec, tot_size, cudaMemcpyHostToDevice);
-	initialize << <1, 32 >> > (dev_min, dev_max, num_channel);
+	cudaStatus = cudaMalloc((void**)&dev_vec, tot_size);
+	if (cudaStatus != cudaSuccess) { cerr << "memory allocation for dev_vec failed"; goto Error1; }
+	cudaStatus = cudaMalloc((void**)&dev_min, num_channel * sizeof(unsigned int));
+	if (cudaStatus != cudaSuccess) { cerr << "memory allocation for dev_min failed"; goto Error2; }
+	cudaStatus = cudaMalloc((void**)&dev_max, num_channel * sizeof(unsigned int));
+	if (cudaStatus != cudaSuccess) { cerr << "memory allocation for dev_max failed"; goto Error3; }
+
+	cudaStatus = cudaMemcpy(dev_vec, vec, tot_size, cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) { cerr << "memory copying to device failed"; goto Error3; }
+	initialize << <1, 32 >> > (dev_min, dev_max, num_channel);  // initalizing min and max arrays
 	cudaDeviceSynchronize();
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) { cerr << "initializing min/max arrays failed"; goto Error3; }
 
 	unsigned int size_grid_reduction(2), size_block_reduction(128);
 
-	const unsigned int num_streams = 3;
+	// each stream is responsible for finding min/max for one channel
+	const unsigned int num_streams = 3;  
 	if (num_streams < num_channel) {
-		cerr << "num_stream must be equal or greater than num_channel" << endl;
-		goto Error;
+		cerr << "num_stream must be equal or greater than num_channel" << endl; goto Error3;
 	}
 
 	cudaStream_t streams[num_streams];
@@ -58,6 +75,7 @@ int main()
 		cudaStreamCreate(&streams[i]);
 	}
 
+	// reduction kernel
 	for (unsigned int i = 0; i < num_channel; i++)
 	{
 		switch (size_block_reduction)
@@ -83,26 +101,46 @@ int main()
 		}
 	}
 	cudaDeviceSynchronize();
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) { cerr << "reduction failed"; goto Error3; }
+
 	if (LOG) tmp<<<1,32>>>(dev_min,  dev_max, num_channel);
 
 	unsigned int size_grid_enhance(2), size_block_enhance(128);
 
+	// enhancing pixel values
 	enhance << <size_grid_enhance, size_block_enhance >> >
 		(dev_vec, dev_min, dev_max, size, num_channel);
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) { cerr << "enhance"; goto Error3; }
 
-	cudaMemcpy(result, dev_vec, tot_size, cudaMemcpyDeviceToHost);
-	for (unsigned int i = 0; i < tot_size; i++) img.data[i] = result[i];
+	cudaStatus = cudaMemcpy(vec, dev_vec, tot_size, cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) { cerr << "memory copying to host failed"; goto Error3; }
+
+	for (unsigned int i = 0; i < num_channel; i++)
+	{
+		for (unsigned int j = 0; j < size; j++)
+		{
+			 BGR[i].data[j] = (uint8_t)vec[i * size + j];
+		}
+	}
+
+	// merging all channels to a single Mat object
+	merge(BGR, num_channel, img);
 	imwrite("enhanced.jpg", img);
 
 	for (unsigned int i = 0; i < num_streams; i++) {
 		cudaStreamDestroy(streams[i]);
 	}
 
-Error:
-	delete[] result;
-	cudaFree(dev_vec);
-	cudaFree(dev_min);
+Error3:
 	cudaFree(dev_max);
+Error2:
+	cudaFree(dev_min);
+Error1:
+	cudaFree(dev_vec);
+	delete[] BGR;
+	delete[] vec;
 
 	return 0;
 }
@@ -239,24 +277,3 @@ __global__ void tmp(unsigned int* dev_min, unsigned int* dev_max, unsigned int n
 		printf("min[%u]= %u,    max[%u]= %u\n", i, dev_min[i], i, dev_max[i]);
 	}
 }
-
-
-
-
-
-    //cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    //if (cudaStatus != cudaSuccess) {
-    //    fprintf(stderr, "cudaMemcpy failed!");
-    //    goto Error;
-    //}
-
-    //// Launch a kernel on the GPU with one thread for each element.
-    //addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
-
-    //// Check for any errors launching the kernel
-    //cudaStatus = cudaGetLastError();
-    //if (cudaStatus != cudaSuccess) {
-    //    fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-    //    goto Error;
-    //}
-    
