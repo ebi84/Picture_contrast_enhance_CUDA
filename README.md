@@ -4,7 +4,7 @@ A cuda code for enhancing the contrast of images
 image before enhancing:
 
 
-<img src="image_enhancer/original.jpg" rotate="90">
+<img src="image_enhancer/original.jpg">
 
 
 image after enhancing
