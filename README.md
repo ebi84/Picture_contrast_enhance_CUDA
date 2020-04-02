@@ -3,8 +3,8 @@ A cuda code for enhancing the contrast of images
 
 image before enhancing:
 
-![alt text](image_enhancer/original.jpg){:height="20%" width="20%"}
 
+<img src="image_enhancer/original.jpg">
 
 
 image after enhancing
